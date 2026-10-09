@@ -18,15 +18,18 @@ import { ADMIN_EMAIL, getFirebaseServices, hasFirebaseConfig } from './firebase.
 import { hasEmailConfig, sendEmail } from './email.js';
 import { describeSyncError, requestCalendarAccess, syncGoogleCalendar } from './calendarSync.js';
 import {
+  durationOf,
   emailTemplates,
+  formatDuration as formatMeetingLength,
+  getCellIds,
   getHostTodayKey,
   getSlotExpiryMs,
-  getSlotId,
   getSlotStartMs,
   getTimeLabel,
   overlapsBlock,
   parseDateKey,
-  TIME_ZONE_LABEL
+  TIME_ZONE_LABEL,
+  titleOf
 } from './booking.js';
 
 const RESYNC_INTERVAL_MS = 15 * 60 * 1000;
@@ -73,11 +76,13 @@ const DateTile = ({ dateKey }) => {
   );
 };
 
-export default function Admin() {
+// `review` ({ bookingId, action }) comes from the Confirm/Decline links in the host's email.
+export default function Admin({ review }) {
   const [services, setServices] = useState(null);
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [bookings, setBookings] = useState([]);
+  const [bookingsLoaded, setBookingsLoaded] = useState(false);
   const [slotsById, setSlotsById] = useState({});
   const [meetingLinks, setMeetingLinks] = useState({});
   const [busyId, setBusyId] = useState(null);
@@ -120,6 +125,7 @@ export default function Admin() {
         const nextBookings = snapshot.docs.map(snapshotDoc => ({ id: snapshotDoc.id, ...snapshotDoc.data() }));
         nextBookings.sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`));
         setBookings(nextBookings);
+        setBookingsLoaded(true);
       },
       (error) => {
         console.error('Firestore Error:', error);
@@ -197,27 +203,27 @@ export default function Admin() {
 
     try {
       const bookingRef = services.doc(services.db, 'bookings', booking.id);
-      const slotRef = services.doc(services.db, 'slots', getSlotId(booking.date, booking.time));
+      const cellRefs = getCellIds(booking).map(id => services.doc(services.db, 'slots', id));
       const update = { status, decidedAt: new Date().toISOString() };
 
       if (status === 'confirmed') {
-        update.meetingLink = (meetingLinks[booking.id] || '').trim();
+        update.meetingLink = (meetingLinks[booking.id] ?? booking.meetingLink ?? '').trim();
       }
 
       // An expired hold may have been taken by someone else, and the booker may have just cancelled,
       // so check both right now.
       await services.runTransaction(services.db, async (transaction) => {
         const current = await transaction.get(bookingRef);
-        const slot = await transaction.get(slotRef);
-        const ownsSlot = slot.exists() && slot.data().bookingId === booking.id;
+        const cells = await Promise.all(cellRefs.map(ref => transaction.get(ref)));
+        const owned = cells.map(cell => cell.exists() && cell.data().bookingId === booking.id);
 
         if (current.data()?.status !== booking.status) throw new Error('ALREADY_CHANGED');
 
         if (status === 'confirmed') {
-          if (!ownsSlot) throw new Error('SLOT_LOST');
-          transaction.update(slotRef, { confirmed: true });
-        } else if (ownsSlot) {
-          transaction.delete(slotRef);
+          if (!owned.every(Boolean)) throw new Error('SLOT_LOST');
+          cellRefs.forEach(ref => transaction.update(ref, { confirmed: true }));
+        } else {
+          cellRefs.forEach((ref, index) => owned[index] && transaction.delete(ref));
         }
 
         transaction.update(bookingRef, update);
@@ -323,13 +329,14 @@ export default function Admin() {
   const activeTab = TABS.find(t => t.id === tab);
 
   const getHoldInfo = (booking) => {
-    const slot = slotsById[getSlotId(booking.date, booking.time)];
+    const cells = getCellIds(booking).map(id => slotsById[id]);
+    const slot = cells[0];
     const requestedAgo = `Requested ${formatDuration(now - Date.parse(booking.createdAt))} ago`;
 
     if (getSlotStartMs(booking.date, booking.time) < now) {
       return { lost: false, tone: 'text-ink-3', text: `${requestedAgo} · The meeting time has passed` };
     }
-    if (!slot || slot.bookingId !== booking.id) {
+    if (cells.some(cell => !cell || cell.bookingId !== booking.id)) {
       return { lost: true, tone: 'text-danger', text: `${requestedAgo} · Hold expired and someone else booked this time` };
     }
 
@@ -346,12 +353,12 @@ export default function Admin() {
     { label: 'All-time requests', value: bookings.length, Icon: History, tone: 'bg-brand-soft text-brand-ink' }
   ];
 
-  const renderBooking = (booking) => {
+  const renderBooking = (booking, { highlight = false } = {}) => {
     const hold = booking.status === 'pending' ? getHoldInfo(booking) : null;
     const isBusy = busyId === booking.id;
 
     return (
-      <li key={booking.id} className="card !rounded-2xl p-4 sm:p-5 animate-rise">
+      <li key={booking.id} className={`card !rounded-2xl p-4 sm:p-5 animate-rise ${highlight ? 'ring-2 ring-brand' : ''}`}>
         <div className="flex gap-4">
           <DateTile dateKey={booking.date} />
           <div className="min-w-0 flex-1">
@@ -370,11 +377,28 @@ export default function Admin() {
               </span>
             </div>
 
-            <p className="mt-3 text-sm text-ink flex items-center gap-1.5">
+            <p className="mt-3 text-sm text-ink flex flex-wrap items-center gap-x-1.5 gap-y-1">
               <Clock size={14} className="text-ink-3" />
               <span className="font-medium">{getTimeLabel(booking.time)}</span>
-              <span className="text-ink-3">· {TIME_ZONE_LABEL}</span>
+              <span className="text-ink-3">· {formatMeetingLength(durationOf(booking))} · {TIME_ZONE_LABEL}</span>
             </p>
+            <p className="mt-1 text-xs font-medium text-ink-2">{titleOf(booking)}</p>
+            {booking.previousDate && (
+              <p className="mt-1 text-xs text-ink-3">
+                Moved by the guest from {getTimeLabel(booking.previousTime)}, {parseDateKey(booking.previousDate).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}
+              </p>
+            )}
+
+            {booking.answers?.length > 0 && (
+              <dl className="mt-3 grid gap-x-4 gap-y-1.5 text-sm sm:grid-cols-[auto_1fr]">
+                {booking.answers.map(answer => (
+                  <React.Fragment key={answer.label}>
+                    <dt className="text-ink-3">{answer.label}</dt>
+                    <dd className="text-ink break-words whitespace-pre-wrap">{answer.value}</dd>
+                  </React.Fragment>
+                ))}
+              </dl>
+            )}
 
             {booking.notes && (
               <p className="mt-3 text-sm text-ink-2 bg-muted rounded-xl px-3.5 py-2.5 whitespace-pre-wrap border-l-2 border-brand">
@@ -389,7 +413,7 @@ export default function Admin() {
             )}
 
             {hold && <p className={`mt-3 text-xs font-medium ${hold.tone}`}>{hold.text}</p>}
-            {booking.status === 'pending' && overlapsBlock(booking.date, booking.time, blocks) && (
+            {booking.status === 'pending' && overlapsBlock(booking.date, booking.time, blocks, 0, durationOf(booking)) && (
               <p className="mt-2 text-xs font-semibold text-danger">Clashes with a busy time in your calendar.</p>
             )}
           </div>
@@ -403,7 +427,7 @@ export default function Admin() {
                 type="url"
                 placeholder="Meeting link (optional)"
                 aria-label={`Meeting link for ${booking.name}`}
-                value={meetingLinks[booking.id] || ''}
+                value={meetingLinks[booking.id] ?? booking.meetingLink ?? ''}
                 onChange={(e) => setMeetingLinks({ ...meetingLinks, [booking.id]: e.target.value })}
                 className="field !pl-10 !py-2.5 text-sm"
               />
@@ -435,6 +459,39 @@ export default function Admin() {
           </div>
         )}
       </li>
+    );
+  };
+
+  // One booking opened from the host's email. Actions still need a click here, so link
+  // scanners or an accidental tap on the email link can't confirm or decline anything.
+  const renderReview = () => {
+    const reviewed = bookings.find(b => b.id === review.bookingId);
+    let hint = null;
+    if (reviewed?.status === 'pending') {
+      hint = review.action === 'decline'
+        ? { tone: 'warn', text: `Tap Decline to let ${reviewed.name} know this time doesn't work.` }
+        : { tone: 'success', text: `Check the details${review.action === 'confirm' ? ', then tap Confirm' : ''}. Add a meeting link first if you have one.` };
+    } else if (reviewed) {
+      hint = { tone: 'warn', text: `This booking is already ${reviewed.status === 'cancelled' && reviewed.cancelledBy === 'booker' ? 'cancelled by the guest' : reviewed.status}.` };
+    }
+
+    return (
+      <section className="mb-10 animate-rise">
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <h2 className="text-xs font-bold text-ink-3 uppercase tracking-widest">From your email</h2>
+          <a href="#admin" className="btn btn-ghost text-sm">Show all bookings</a>
+        </div>
+        {reviewed ? (
+          <>
+            {hint && <Banner tone={hint.tone} className="mb-3">{hint.text}</Banner>}
+            <ul>{renderBooking(reviewed, { highlight: true })}</ul>
+          </>
+        ) : bookingsLoaded ? (
+          <Banner>That booking wasn't found. It may have been deleted.</Banner>
+        ) : (
+          <div className="card !rounded-2xl p-5 space-y-3"><div className="skeleton h-5 w-1/3" /><div className="skeleton h-16 w-full" /></div>
+        )}
+      </section>
     );
   };
 
@@ -471,6 +528,8 @@ export default function Admin() {
           {notice && <Banner tone="success" onDismiss={() => setNotice('')}>{notice}</Banner>}
           {errorMessage && <Banner onDismiss={() => setErrorMessage('')}>{errorMessage}</Banner>}
         </div>
+
+        {review && renderReview()}
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-8">
           {stats.map(({ label, value, Icon, tone }) => (

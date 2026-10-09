@@ -1,7 +1,58 @@
 export const MEETING_TITLE = '30 Minute Meeting';
 export const HOST_NAME = 'Prashant Sharma';
 export const TIME_ZONE_LABEL = 'India Standard Time';
-export const MEETING_DURATION_MINUTES = 30;
+export const MEETING_DURATION_MINUTES = 30; // default length, and the size of one reservation cell
+
+/* ---------- Meeting types (eventTypes collection, edited on the admin Settings tab) ---------- */
+
+export const DURATION_OPTIONS = [15, 30, 45, 60, 90, 120];
+export const TYPE_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
+
+// Used until the host saves their own types; firestore.rules accepts this one without a saved doc.
+export const DEFAULT_EVENT_TYPE = {
+  id: '30min',
+  title: MEETING_TITLE,
+  duration: 30,
+  description: '',
+  meetingLink: '',
+  autoConfirm: false,
+  active: true,
+  order: 0,
+  questions: []
+};
+
+export const sortEventTypes = (types) => [...types].sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.title.localeCompare(b.title));
+
+export const formatDuration = (minutes) => (
+  minutes < 60 ? `${minutes} min` : `${minutes / 60 === Math.floor(minutes / 60) ? minutes / 60 : (minutes / 60).toFixed(1)} hr`
+);
+
+export const slugify = (text) => text.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+
+export const getBookingUrl = (typeId) => `${window.location.origin}${window.location.pathname}#book/${typeId}`;
+
+// Custom booking-form questions, per meeting type. firestore.rules caps these at 5 too.
+export const MAX_QUESTIONS = 5;
+export const QUESTION_KINDS = [
+  { id: 'short', label: 'Short answer' },
+  { id: 'long', label: 'Paragraph' },
+  { id: 'phone', label: 'Phone number' },
+  { id: 'choice', label: 'Multiple choice' }
+];
+const ANSWER_LIMITS = { short: 300, long: 1000, phone: 40, choice: 100 };
+
+// Snapshot of the answered questions, stored on the booking as [{ label, value }] so later
+// edits to the questions don't change what the guest actually answered.
+export const collectAnswers = (questions, answers) => questions
+  .map(question => ({
+    label: question.label,
+    value: (answers[question.id] || '').trim().slice(0, ANSWER_LIMITS[question.kind] || 300)
+  }))
+  .filter(answer => answer.value);
+
+// Bookings made before meeting types existed have no type fields.
+export const titleOf = (booking) => booking.typeTitle || MEETING_TITLE;
+export const durationOf = (booking) => booking.duration || MEETING_DURATION_MINUTES;
 
 // Booking policy. firestore.rules enforces the same numbers, so keep them in sync.
 // IST has no daylight saving, so a fixed offset is exact.
@@ -80,17 +131,27 @@ export const normalizeAvailability = (data) => ({
 });
 
 // All start times on a day according to the weekly hours (ignores bookings and notice).
-export const getDaySlots = (dateKey, availability) => {
+// Starts are on the half hour; the whole meeting must end within the hours.
+export const getDaySlots = (dateKey, availability, duration = MEETING_DURATION_MINUTES) => {
   if (availability.daysOff.includes(dateKey)) return [];
   const hours = availability.weekly[parseDateKey(dateKey).getDay()];
   if (!hours) return [];
 
   const times = [];
-  for (let minutes = toMinutes(hours.start); minutes + MEETING_DURATION_MINUTES <= toMinutes(hours.end); minutes += 30) {
+  for (let minutes = toMinutes(hours.start); minutes + duration <= toMinutes(hours.end); minutes += 30) {
     times.push(fromMinutes(minutes));
   }
   return times;
 };
+
+// A booking reserves every half-hour cell it touches (a 60-minute meeting at 10:00 holds 10:00 and 10:30),
+// one `slots` doc per cell. That's what stops a longer meeting overlapping another booking.
+export const getCellTimes = (time, duration = MEETING_DURATION_MINUTES) => {
+  const start = toMinutes(time);
+  return Array.from({ length: Math.ceil(duration / 30) }, (_, index) => fromMinutes(start + index * 30));
+};
+
+export const getCellIds = (booking) => getCellTimes(booking.time, durationOf(booking)).map(time => getSlotId(booking.date, time));
 
 // Slot times are the host's wall-clock times, whatever time zone the visitor is in.
 export const getSlotStartMs = (dateKey, time) => {
@@ -130,9 +191,9 @@ export const isSlotHeld = (slot, now = Date.now()) => {
 
 // Busy blocks ({ date, start, end }, host time, end exclusive) come from manual "block time"
 // entries and Google Calendar sync. A meeting at `time` clashes if it overlaps one, buffer included.
-export const overlapsBlock = (dateKey, time, blocks, bufferMinutes = 0) => {
+export const overlapsBlock = (dateKey, time, blocks, bufferMinutes = 0, duration = MEETING_DURATION_MINUTES) => {
   const start = toMinutes(time);
-  const end = start + MEETING_DURATION_MINUTES;
+  const end = start + duration;
   return blocks.some(block => (
     block.date === dateKey
     && start < toMinutes(block.end) + bufferMinutes
@@ -140,23 +201,19 @@ export const overlapsBlock = (dateKey, time, blocks, bufferMinutes = 0) => {
   ));
 };
 
-// Open times on a day: inside working hours, outside the notice window, not held, not busy,
-// not within the buffer of a held meeting or busy block, and the day isn't at its meeting limit.
-export const getAvailableTimes = (dateKey, availability, heldSlots, blocks = [], now = Date.now()) => {
-  const heldTimes = heldSlots
-    .filter(slot => slot.date === dateKey && isSlotHeld(slot, now))
-    .map(slot => toMinutes(slot.time));
-
-  if (availability.maxPerDay > 0 && heldTimes.length >= availability.maxPerDay) return [];
+// Open start times on a day for a meeting of `duration` minutes: inside working hours, outside the
+// notice window, not overlapping a held cell or busy block (buffer included), and the day isn't at
+// its meeting limit.
+export const getAvailableTimes = (dateKey, availability, heldSlots, blocks = [], duration = MEETING_DURATION_MINUTES, now = Date.now()) => {
+  const heldCells = heldSlots.filter(slot => slot.date === dateKey && isSlotHeld(slot, now));
+  const meetingsThatDay = new Set(heldCells.map(slot => slot.bookingId ?? slot.id)).size;
+  if (availability.maxPerDay > 0 && meetingsThatDay >= availability.maxPerDay) return [];
 
   const buffer = availability.bufferMinutes || 0;
-  const minGap = MEETING_DURATION_MINUTES + buffer;
-  return getDaySlots(dateKey, availability).filter(time => {
-    const minutes = toMinutes(time);
-    return isSlotBookable(dateKey, time, now)
-      && heldTimes.every(held => Math.abs(held - minutes) >= minGap)
-      && !overlapsBlock(dateKey, time, blocks, buffer);
-  });
+  const busy = [...heldCells.map(slot => ({ date: dateKey, start: slot.time, end: fromMinutes(toMinutes(slot.time) + 30) })), ...blocks];
+  return getDaySlots(dateKey, availability, duration).filter(time => (
+    isSlotBookable(dateKey, time, now) && !overlapsBlock(dateKey, time, busy, buffer, duration)
+  ));
 };
 
 // Turns Google free/busy intervals (ISO strings) into per-day blocks in host time,
@@ -211,8 +268,8 @@ const getEventDetails = (booking) => {
   const start = getSlotStartMs(booking.date, booking.time);
   return {
     start,
-    end: start + MEETING_DURATION_MINUTES * MINUTE_MS,
-    title: `${MEETING_TITLE} with ${HOST_NAME}`,
+    end: start + durationOf(booking) * MINUTE_MS,
+    title: `${titleOf(booking)} with ${HOST_NAME}`,
     details: booking.meetingLink ? `Join: ${booking.meetingLink}` : 'Meeting link to follow.',
     location: booking.meetingLink || 'Online'
   };
@@ -267,34 +324,68 @@ export const buildIcsFile = (booking, uid) => {
   ].join('\r\n');
 };
 
+// Browser-only: saves the .ics file via a temporary download link.
+export const downloadIcsFile = (booking, uid) => {
+  const url = URL.createObjectURL(new Blob([buildIcsFile(booking, uid)], { type: 'text/calendar;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'meeting.ics';
+  link.click();
+  URL.revokeObjectURL(url);
+};
+
 /* ---------- Emails (shared by the booking, manage and admin pages) ---------- */
 
 const manageLine = (booking) => (
   booking.manageId ? `View or cancel your booking: ${getManageUrl(booking.manageId)}\n\n` : ''
 );
 
+// Admin deep links: open one booking on the admin page with Confirm/Decline ready (one click, never automatic).
+export const getReviewUrl = (bookingId, action) => (
+  `${window.location.origin}${window.location.pathname}#admin/review/${bookingId}${action ? `/${action}` : ''}`
+);
+
+const meetingLine = (booking) => `${titleOf(booking)} (${formatDuration(durationOf(booking))})`;
+const dateOf = (booking) => formatDisplayDate(parseDateKey(booking.date), true);
+
+// The guest's answers to the custom questions, then their free-text notes.
+const detailsBlock = (booking) => (
+  (booking.answers || []).map(answer => `${answer.label}: ${answer.value}\n`).join('') +
+  `Notes: ${booking.notes || '(none)'}\n\n`
+);
+
 export const emailTemplates = {
   requestReceived: (booking) => ({
-    subject: `Booking request received: ${MEETING_TITLE}`,
+    subject: `Booking request received: ${titleOf(booking)}`,
     message:
       `Hi ${booking.name},\n\n` +
-      `We received your request for a ${MEETING_TITLE} with ${HOST_NAME} on ${describeSlot(booking.date, booking.time)}.\n\n` +
+      `We received your request for a ${meetingLine(booking)} with ${HOST_NAME} on ${describeSlot(booking.date, booking.time)}.\n\n` +
       `This booking is NOT confirmed yet. You will get another email as soon as it is confirmed or declined. ` +
       `If it isn't confirmed within ${PENDING_EXPIRY_HOURS} hours, the request expires and the time is released.\n\n` +
       manageLine(booking)
   }),
-  hostNewRequest: (booking, adminUrl) => ({
+  hostNewRequest: (booking, bookingId) => ({
     subject: `New booking request from ${booking.name}`,
     message:
-      `${booking.name} <${booking.email}> requested ${describeSlot(booking.date, booking.time)}.\n\n` +
-      `Notes: ${booking.notes || '(none)'}\n\n` +
-      `Confirm or decline it within ${PENDING_EXPIRY_HOURS} hours, after which the time is released to others: ${adminUrl}`
+      `${booking.name} <${booking.email}> requested a ${meetingLine(booking)} on ${describeSlot(booking.date, booking.time)}.\n\n` +
+      detailsBlock(booking) +
+      `Confirm: ${getReviewUrl(bookingId, 'confirm')}\n` +
+      `Decline: ${getReviewUrl(bookingId, 'decline')}\n\n` +
+      `Respond within ${PENDING_EXPIRY_HOURS} hours, after which the time is released to others.`
+  }),
+  hostNewBooking: (booking, bookingId) => ({
+    subject: `New booking: ${booking.name}, ${dateOf(booking)}`,
+    message:
+      `${booking.name} <${booking.email}> booked a ${meetingLine(booking)} on ${describeSlot(booking.date, booking.time)}.\n` +
+      `It was confirmed automatically because this meeting type doesn't need approval.\n\n` +
+      detailsBlock(booking) +
+      `View or cancel it: ${getReviewUrl(bookingId)}`
   }),
   confirmed: (booking) => ({
-    subject: `Confirmed: ${MEETING_TITLE} on ${formatDisplayDate(parseDateKey(booking.date), true)}`,
+    subject: `Confirmed: ${titleOf(booking)} on ${dateOf(booking)}`,
     message:
       `Hi ${booking.name},\n\n` +
-      `Your ${MEETING_TITLE} with ${HOST_NAME} is confirmed for ${describeSlot(booking.date, booking.time)}.\n\n` +
+      `Your ${meetingLine(booking)} with ${HOST_NAME} is confirmed for ${describeSlot(booking.date, booking.time)}.\n\n` +
       (booking.meetingLink ? `Join here: ${booking.meetingLink}\n\n` : 'Web conferencing details will follow.\n\n') +
       `Add it to your calendar:\n` +
       `Google: ${getGoogleCalendarUrl(booking)}\n` +
@@ -305,23 +396,55 @@ export const emailTemplates = {
       'See you then!'
   }),
   declined: (booking) => ({
-    subject: `Not available: ${MEETING_TITLE} on ${formatDisplayDate(parseDateKey(booking.date), true)}`,
+    subject: `Not available: ${titleOf(booking)} on ${dateOf(booking)}`,
     message:
       `Hi ${booking.name},\n\n` +
       `Unfortunately ${HOST_NAME} can't make ${describeSlot(booking.date, booking.time)}. ` +
       'Please pick another time on the booking page.'
   }),
   cancelled: (booking) => ({
-    subject: `Cancelled: ${MEETING_TITLE} on ${formatDisplayDate(parseDateKey(booking.date), true)}`,
+    subject: `Cancelled: ${titleOf(booking)} on ${dateOf(booking)}`,
     message:
       `Hi ${booking.name},\n\n` +
-      `Your ${MEETING_TITLE} on ${describeSlot(booking.date, booking.time)} has been cancelled by ${HOST_NAME}. ` +
+      `Your ${titleOf(booking)} on ${describeSlot(booking.date, booking.time)} has been cancelled by ${HOST_NAME}. ` +
       'Please pick another time on the booking page if you would still like to meet.'
   }),
   hostBookerCancelled: (booking) => ({
     subject: `${booking.name} cancelled their booking`,
     message:
-      `${booking.name} cancelled their ${MEETING_TITLE} on ${describeSlot(booking.date, booking.time)}.\n\n` +
+      `${booking.name} cancelled their ${titleOf(booking)} on ${describeSlot(booking.date, booking.time)}.\n\n` +
       'The time is open again for others to book.'
+  }),
+  // `booking` already has the new date/time and status; `previous` is { date, time }.
+  guestRescheduled: (booking, previous) => (booking.status === 'confirmed'
+    ? {
+      subject: `Moved: ${titleOf(booking)} is now ${dateOf(booking)}`,
+      message:
+        `Hi ${booking.name},\n\n` +
+        `Your ${meetingLine(booking)} with ${HOST_NAME} has moved from ${describeSlot(previous.date, previous.time)} ` +
+        `to ${describeSlot(booking.date, booking.time)}. It's confirmed.\n\n` +
+        (booking.meetingLink ? `Join here: ${booking.meetingLink}\n\n` : '') +
+        `Update your calendar:\n` +
+        `Google: ${getGoogleCalendarUrl(booking)}\n` +
+        `Outlook: ${getOutlookCalendarUrl(booking)}\n\n` +
+        manageLine(booking)
+    }
+    : {
+      subject: `Change requested: ${titleOf(booking)} on ${dateOf(booking)}`,
+      message:
+        `Hi ${booking.name},\n\n` +
+        `You asked to move your ${meetingLine(booking)} from ${describeSlot(previous.date, previous.time)} ` +
+        `to ${describeSlot(booking.date, booking.time)}.\n\n` +
+        `${HOST_NAME} needs to confirm the new time. You'll get another email either way.\n\n` +
+        manageLine(booking)
+    }),
+  hostRescheduled: (booking, bookingId, previous) => ({
+    subject: `${booking.name} moved their booking to ${dateOf(booking)}`,
+    message:
+      `${booking.name} <${booking.email}> moved their ${meetingLine(booking)} ` +
+      `from ${describeSlot(previous.date, previous.time)} to ${describeSlot(booking.date, booking.time)}.\n\n` +
+      (booking.status === 'confirmed'
+        ? `It stays confirmed because this meeting type doesn't need approval.\nView it: ${getReviewUrl(bookingId)}`
+        : `The new time needs your approval.\nConfirm: ${getReviewUrl(bookingId, 'confirm')}\nDecline: ${getReviewUrl(bookingId, 'decline')}`)
   })
 };

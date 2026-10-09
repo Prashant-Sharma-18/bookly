@@ -10,6 +10,7 @@ import {
   parseDateKey
 } from './booking.js';
 import BusyTimes from './BusyTimes.jsx';
+import MeetingTypes from './MeetingTypes.jsx';
 
 // Monday first, using JS weekday numbers.
 const WEEKDAYS = [
@@ -101,6 +102,8 @@ export default function Settings({ services, blocks, syncing, onSync, onSaved, o
 
   return (
     <div className="space-y-4 animate-rise">
+      <MeetingTypes services={services} onNotice={onSaved} onError={onError} />
+
       <Section title="Weekly hours" description="When people can book you. Times are in India Standard Time.">
         <ul className="divide-y divide-line">
           {WEEKDAYS.map(([day, name]) => {
@@ -203,7 +206,7 @@ export default function Settings({ services, blocks, syncing, onSync, onSaved, o
       </div>
 
       <div className="sticky bottom-4 z-10 flex items-center justify-end gap-3 rounded-full bg-surface/90 backdrop-blur border border-line shadow-[var(--shadow-card)] p-2 pl-5">
-        <p className="text-sm text-ink-2 mr-auto">{isDirty ? 'You have unsaved changes.' : 'All changes saved.'}</p>
+        <p className="text-sm text-ink-2 mr-auto">{isDirty ? 'Unsaved changes to hours, days off, buffer or limit.' : 'Availability saved.'}</p>
         {isDirty && (
           <button type="button" onClick={() => setDraft(saved)} disabled={isSaving} className="btn btn-ghost">Discard</button>
         )}

@@ -1,23 +1,33 @@
 import React, { useEffect, useState } from 'react';
-import { CalendarPlus, CalendarX2, CheckCircle2, Download, Globe, Hourglass, Link2, Loader2, Video, XCircle } from 'lucide-react';
+import { CalendarClock, CalendarPlus, CalendarX2, CheckCircle2, Download, Globe, Hourglass, Link2, Loader2, Video, X, XCircle } from 'lucide-react';
 import { ADMIN_EMAIL, getFirebaseServices, hasFirebaseConfig } from './firebase.js';
 import { sendEmail } from './email.js';
 import {
-  buildIcsFile,
+  DEFAULT_EVENT_TYPE,
+  downloadIcsFile,
+  durationOf,
   emailTemplates,
+  formatDateKey,
   formatDisplayDate,
+  formatDuration,
   formatInVisitorTime,
+  getAvailableTimes,
+  getCellIds,
+  getCellTimes,
+  getSlotId,
+  isSlotHeld,
   getGoogleCalendarUrl,
   getOutlookCalendarUrl,
-  getSlotId,
   getSlotStartMs,
   getTimeLabel,
   HOST_NAME,
-  MEETING_TITLE,
   parseDateKey,
   TIME_ZONE_LABEL,
+  titleOf,
   visitorIsInHostTimeZone
 } from './booking.js';
+import SlotPicker from './SlotPicker.jsx';
+import useBookingData from './useBookingData.js';
 import { Avatar, Banner, Logo } from './ui.jsx';
 
 const STATUS = {
@@ -40,6 +50,7 @@ export default function Manage({ token }) {
   const [services, setServices] = useState(null);
   const [booking, setBooking] = useState(undefined); // undefined = loading, null = not found
   const [isCancelling, setIsCancelling] = useState(false);
+  const [isRescheduling, setIsRescheduling] = useState(false);
   const [notice, setNotice] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
 
@@ -84,28 +95,28 @@ export default function Manage({ token }) {
     try {
       const manageRef = services.doc(services.db, 'manage', token);
       const bookingRef = services.doc(services.db, 'bookings', booking.bookingId);
-      const slotRef = services.doc(services.db, 'slots', getSlotId(booking.date, booking.time));
+      const cellRefs = getCellIds(booking).map(id => services.doc(services.db, 'slots', id));
       const now = new Date().toISOString();
 
-      // The rules only accept this when all three writes agree, and only for whoever holds the token.
+      // The rules only accept this when the writes agree, and only for whoever holds the token.
       await services.runTransaction(services.db, async (transaction) => {
         const current = await transaction.get(manageRef);
-        const slot = await transaction.get(slotRef);
+        const cells = await Promise.all(cellRefs.map(ref => transaction.get(ref)));
         if (!['pending', 'confirmed'].includes(current.data()?.status)) throw new Error('NOT_CANCELLABLE');
 
         transaction.update(manageRef, { status: 'cancelled', cancelledAt: now });
         transaction.update(bookingRef, { status: 'cancelled', cancelledBy: 'booker', decidedAt: now });
-        // An expired hold may already belong to someone else; only free it if it's still ours.
-        if (slot.exists() && slot.data().bookingId === booking.bookingId) {
-          transaction.delete(slotRef);
-        }
+        // An expired hold may already belong to someone else; only free the cells that are still ours.
+        cells.forEach((cell, index) => {
+          if (cell.exists() && cell.data().bookingId === booking.bookingId) transaction.delete(cellRefs[index]);
+        });
       });
 
       await Promise.all([
         ADMIN_EMAIL ? sendEmail({ toEmail: ADMIN_EMAIL, ...emailTemplates.hostBookerCancelled(booking), replyTo: booking.email }) : null,
         sendEmail({
           toEmail: booking.email,
-          subject: `You cancelled: ${MEETING_TITLE} on ${formatDisplayDate(parseDateKey(booking.date), true)}`,
+          subject: `You cancelled: ${titleOf(booking)} on ${formatDisplayDate(parseDateKey(booking.date), true)}`,
           message: `Hi ${booking.name},\n\nYour booking has been cancelled and ${HOST_NAME} has been notified.`,
           replyTo: ADMIN_EMAIL
         })
@@ -119,16 +130,6 @@ export default function Manage({ token }) {
     } finally {
       setIsCancelling(false);
     }
-  };
-
-  const downloadIcs = () => {
-    const blob = new Blob([buildIcsFile(booking, booking.bookingId)], { type: 'text/calendar;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'meeting.ics';
-    link.click();
-    URL.revokeObjectURL(url);
   };
 
   if (booking === undefined) {
@@ -176,8 +177,8 @@ export default function Manage({ token }) {
           <div className="flex items-center gap-3">
             <Avatar name={HOST_NAME} size="size-10" className="text-sm" />
             <div>
-              <p className="font-semibold text-ink">{MEETING_TITLE}</p>
-              <p className="text-sm text-ink-2">with {HOST_NAME}</p>
+              <p className="font-semibold text-ink">{titleOf(booking)}</p>
+              <p className="text-sm text-ink-2">{formatDuration(durationOf(booking))} with {HOST_NAME}</p>
             </div>
           </div>
           <div className="space-y-2.5 text-sm text-ink-2">
@@ -209,7 +210,7 @@ export default function Manage({ token }) {
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 <a href={getGoogleCalendarUrl(booking)} target="_blank" rel="noreferrer" className="btn btn-outline">Google</a>
                 <a href={getOutlookCalendarUrl(booking)} target="_blank" rel="noreferrer" className="btn btn-outline">Outlook</a>
-                <button onClick={downloadIcs} className="btn btn-outline"><Download size={16} /> Apple / .ics</button>
+                <button onClick={() => downloadIcsFile(booking, booking.bookingId)} className="btn btn-outline"><Download size={16} /> Apple / .ics</button>
               </div>
             </div>
           )}
@@ -217,14 +218,142 @@ export default function Manage({ token }) {
           <div className="flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3 pt-2">
             <a href="#" className="btn btn-ghost -ml-3">Book another time</a>
             {canCancel && (
-              <button onClick={cancelBooking} disabled={isCancelling} className="btn btn-ghost !text-danger hover:!bg-danger-soft">
-                {isCancelling ? <Loader2 size={16} className="animate-spin" /> : <CalendarX2 size={16} />} Cancel booking
-              </button>
+              <div className="flex flex-col-reverse sm:flex-row gap-2">
+                <button onClick={cancelBooking} disabled={isCancelling} className="btn btn-ghost !text-danger hover:!bg-danger-soft">
+                  {isCancelling ? <Loader2 size={16} className="animate-spin" /> : <CalendarX2 size={16} />} Cancel booking
+                </button>
+                {!isRescheduling && (
+                  <button onClick={() => { setIsRescheduling(true); setNotice(''); }} disabled={isCancelling} className="btn btn-primary">
+                    <CalendarClock size={16} /> Change time
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </div>
       </div>
-      <p className="text-center text-xs text-ink-3 mt-6">Keep this link private. Anyone with it can cancel this booking.</p>
+
+      {isRescheduling && canCancel && (
+        <Reschedule
+          booking={booking}
+          token={token}
+          services={services}
+          onClose={() => setIsRescheduling(false)}
+          onMoved={(message) => { setIsRescheduling(false); setNotice(message); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+        />
+      )}
+      <p className="text-center text-xs text-ink-3 mt-6">Keep this link private. Anyone with it can change or cancel this booking.</p>
     </Shell>
+  );
+}
+
+// Lets the guest pick a new time for the same meeting type. Instant-confirm types stay confirmed;
+// others go back to pending for the host to approve the new time.
+function Reschedule({ booking, token, services, onClose, onMoved }) {
+  const { cells, availability, blocks, eventTypes, loading } = useBookingData();
+  const [newDate, setNewDate] = useState(null);
+  const [newTime, setNewTime] = useState(null);
+  const [isMoving, setIsMoving] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+
+  const duration = durationOf(booking);
+  const type = (eventTypes || []).find(t => t.id === (booking.typeId || DEFAULT_EVENT_TYPE.id));
+  const staysConfirmed = Boolean(type?.autoConfirm);
+  // The guest's own cells don't block them: they can move to an overlapping time.
+  const otherCells = cells.filter(cell => cell.bookingId !== booking.bookingId);
+
+  const move = async () => {
+    setIsMoving(true);
+    setErrorMessage('');
+    const date = formatDateKey(newDate);
+    const status = staysConfirmed ? 'confirmed' : 'pending';
+    const previous = { date: booking.date, time: booking.time };
+
+    try {
+      if (!getAvailableTimes(date, availability, otherCells, blocks, duration).includes(newTime)) throw new Error('SLOT_TAKEN');
+
+      const manageRef = services.doc(services.db, 'manage', token);
+      const bookingRef = services.doc(services.db, 'bookings', booking.bookingId);
+      const oldIds = getCellIds(booking);
+      const newIds = getCellTimes(newTime, duration).map(time => getSlotId(date, time));
+      const oldRefs = oldIds.map(id => services.doc(services.db, 'slots', id));
+      const newRefs = newIds.map(id => services.doc(services.db, 'slots', id));
+
+      await services.runTransaction(services.db, async (transaction) => {
+        const current = await transaction.get(manageRef);
+        const oldCells = await Promise.all(oldRefs.map(ref => transaction.get(ref)));
+        const newCells = await Promise.all(newRefs.map(ref => transaction.get(ref)));
+        if (!['pending', 'confirmed'].includes(current.data()?.status)) throw new Error('NOT_MOVABLE');
+        if (newCells.some(cell => cell.exists() && cell.data().bookingId !== booking.bookingId && isSlotHeld(cell.data()))) {
+          throw new Error('SLOT_TAKEN');
+        }
+
+        const movedAt = services.serverTimestamp();
+        transaction.update(bookingRef, { date, time: newTime, status, rescheduledAt: movedAt, previousDate: previous.date, previousTime: previous.time });
+        transaction.update(manageRef, { date, time: newTime, status, rescheduledAt: movedAt });
+        newRefs.forEach((ref, index) => transaction.set(ref, {
+          date,
+          time: getCellTimes(newTime, duration)[index],
+          bookingId: booking.bookingId,
+          confirmed: status === 'confirmed',
+          createdAt: movedAt
+        }));
+        // Free the old cells this booking still holds, unless the new time reuses them.
+        oldRefs.forEach((ref, index) => {
+          if (!newIds.includes(oldIds[index]) && oldCells[index].exists() && oldCells[index].data().bookingId === booking.bookingId) {
+            transaction.delete(ref);
+          }
+        });
+      });
+
+      const moved = { ...booking, date, time: newTime, status, manageId: token };
+      await Promise.all([
+        sendEmail({ toEmail: booking.email, ...emailTemplates.guestRescheduled(moved, previous), replyTo: ADMIN_EMAIL }),
+        ADMIN_EMAIL ? sendEmail({ toEmail: ADMIN_EMAIL, ...emailTemplates.hostRescheduled(moved, booking.bookingId, previous), replyTo: booking.email }) : null
+      ]);
+      onMoved(staysConfirmed
+        ? `Moved to ${getTimeLabel(newTime)}, ${formatDisplayDate(newDate, true)}. It's still confirmed.`
+        : `Moved to ${getTimeLabel(newTime)}, ${formatDisplayDate(newDate, true)}. ${HOST_NAME} will confirm the new time.`);
+    } catch (error) {
+      console.error('Reschedule Error:', error);
+      setErrorMessage(
+        error.message === 'SLOT_TAKEN' ? 'That time was just taken. Please pick another.'
+          : error.message === 'NOT_MOVABLE' ? 'This booking can no longer be changed.'
+            : 'Unable to move the booking right now. Please try again.'
+      );
+      if (error.message === 'SLOT_TAKEN') setNewTime(null);
+    } finally {
+      setIsMoving(false);
+    }
+  };
+
+  return (
+    <div className="card mt-6 p-6 sm:p-8 animate-rise">
+      <div className="flex items-start justify-between gap-3 mb-1">
+        <h2 className="text-xl font-semibold tracking-tight text-ink">Pick a new time</h2>
+        <button onClick={onClose} disabled={isMoving} className="btn btn-ghost !p-2" aria-label="Close"><X size={18} /></button>
+      </div>
+      <p className="text-sm text-ink-2 mb-6">
+        {staysConfirmed ? 'Your booking stays confirmed at the new time.' : `${HOST_NAME} will be asked to confirm the new time.`}
+      </p>
+      {errorMessage && <Banner className="mb-6" onDismiss={() => setErrorMessage('')}>{errorMessage}</Banner>}
+
+      {loading ? (
+        <div className="skeleton h-64 w-full" aria-busy="true" />
+      ) : (
+        <SlotPicker
+          availability={availability}
+          cells={otherCells}
+          blocks={blocks}
+          duration={duration}
+          selectedDate={newDate}
+          selectedTime={newTime}
+          onSelectDate={(date) => { setNewDate(date); setNewTime(null); }}
+          onSelectTime={setNewTime}
+          onNext={() => !isMoving && move()}
+          nextLabel={isMoving ? 'Moving…' : 'Move here'}
+        />
+      )}
+    </div>
   );
 }

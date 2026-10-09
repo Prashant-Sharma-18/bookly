@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "node --test tests/booking.test.mjs",
+    "test:rules": "npx --yes firebase-tools@latest emulators:exec --config firebase.test.json --only firestore --project demo-bookly \"node --test tests/rules.test.mjs\"",
     "firebase": "npx --yes firebase-tools@latest",
     "rules": "node scripts/build-rules.mjs",
     "deploy": "node scripts/build-rules.mjs && vite build && npx --yes firebase-tools@latest deploy --only hosting,firestore:rules",
@@ -22,6 +24,7 @@
     "vite": "^7.1.9"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.2",
     "@tailwindcss/vite": "^4.3.3",
     "tailwindcss": "^4.3.3"
   },

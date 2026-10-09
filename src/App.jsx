@@ -1,52 +1,52 @@
 /* global __app_id */
 import React, { useState, useEffect } from 'react';
 import {
-  ChevronLeft,
-  ChevronRight,
   Clock,
   Globe,
   Video,
   Calendar as CalendarIcon,
   ArrowLeft,
   ArrowRight,
-  CalendarDays,
+  CalendarX2,
   Check,
+  CheckCircle2,
+  Download,
   Hourglass,
-  Loader2
+  Loader2,
+  Zap
 } from 'lucide-react';
 import { ADMIN_EMAIL, getFirebaseServices, hasFirebaseConfig } from './firebase.js';
 import { sendEmail } from './email.js';
 import {
+  collectAnswers,
   createManageToken,
-  DEFAULT_AVAILABILITY,
+  DEFAULT_EVENT_TYPE,
+  downloadIcsFile,
   emailTemplates,
   formatDateKey,
   formatDisplayDate,
+  formatDuration,
   formatInVisitorTime,
   getAvailableTimes,
-  getHostTodayKey,
+  getCellTimes,
+  getGoogleCalendarUrl,
   getManageUrl,
+  getOutlookCalendarUrl,
   getSlotId,
   getTimeLabel,
   HOST_NAME,
   isSlotHeld,
-  MAX_DAYS_AHEAD,
-  MEETING_TITLE,
-  normalizeAvailability,
   PENDING_EXPIRY_HOURS,
+  sortEventTypes,
   TIME_ZONE_LABEL,
   visitorIsInHostTimeZone
 } from './booking.js';
+import SlotPicker from './SlotPicker.jsx';
+import useBookingData from './useBookingData.js';
 import { Avatar, Banner, Logo } from './ui.jsx';
 
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 const LOCAL_STORAGE_KEY = `bookly:${appId}:appointments`;
-
-const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const DAY_NAMES = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
-
-const getDaysInMonth = (year, month) => new Date(year, month + 1, 0).getDate();
-const getFirstDayOfMonth = (year, month) => new Date(year, month, 1).getDay();
 
 const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
@@ -63,114 +63,91 @@ const saveLocalAppointments = (appointments) => {
   localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(appointments));
 };
 
-export default function App() {
-  // Taken slots ({ date, time }). With Firebase these come from the public `slots` collection,
-  // which holds no personal details; the bookings themselves are only readable by the host.
-  const [appointments, setAppointments] = useState([]);
-  const [availability, setAvailability] = useState(DEFAULT_AVAILABILITY);
-  const [blocks, setBlocks] = useState([]); // busy times: manual blocks + Google Calendar sync
-  const [dataLoading, setDataLoading] = useState(true);
+// One input for a host-defined question (Settings > Meeting types > Questions).
+function QuestionField({ question, value, onChange }) {
+  const id = `q-${question.id}`;
+  const label = (
+    <label htmlFor={id} className="block text-sm font-medium text-ink mb-1.5">
+      {question.label} {!question.required && <span className="text-ink-3 font-normal">Optional</span>}
+    </label>
+  );
+
+  if (question.kind === 'choice') {
+    return (
+      <div>
+        {label}
+        <select id={id} required={question.required} value={value} onChange={(e) => onChange(e.target.value)} className="field">
+          <option value="">Choose…</option>
+          {question.options.map(option => <option key={option} value={option}>{option}</option>)}
+        </select>
+      </div>
+    );
+  }
+
+  if (question.kind === 'long') {
+    return (
+      <div>
+        {label}
+        <textarea id={id} rows={3} required={question.required} maxLength={1000} value={value} onChange={(e) => onChange(e.target.value)} className="field resize-none" />
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {label}
+      <input
+        id={id}
+        type={question.kind === 'phone' ? 'tel' : 'text'}
+        autoComplete={question.kind === 'phone' ? 'tel' : 'off'}
+        required={question.required}
+        maxLength={300}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="field"
+      />
+    </div>
+  );
+}
+
+// `typeSlug` comes from the #book/<slug> route. Without it, the page shows the only active
+// meeting type directly, or a picker when there are several.
+export default function App({ typeSlug }) {
+  const {
+    cells: appointments, setCells: setAppointments, availability, blocks, eventTypes, loading: dataLoading, error: loadError
+  } = useBookingData({ localCells: hasFirebaseConfig ? null : loadLocalAppointments() });
   const [manageToken, setManageToken] = useState('');
+  const [bookedResult, setBookedResult] = useState(null); // { booking, bookingId } after submitting
 
   // App State: 0 = Calendar/Time Selection, 1 = Form, 2 = Success
   const [step, setStep] = useState(0);
 
   // Selection State
-  const [currentDate, setCurrentDate] = useState(new Date());
   const [selectedDate, setSelectedDate] = useState(null);
   const [selectedTimeSlot, setSelectedTimeSlot] = useState(null);
 
   // Form State
   const [formData, setFormData] = useState({ name: '', email: '', notes: '' });
+  const [answers, setAnswers] = useState({});
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [submittedEmail, setSubmittedEmail] = useState('');
   const [emailSent, setEmailSent] = useState(false);
 
+  const activeTypes = sortEventTypes((eventTypes || []).filter(type => type.active !== false));
+  const eventType = typeSlug
+    ? activeTypes.find(type => type.id === typeSlug)
+    : (activeTypes.length === 1 ? activeTypes[0] : undefined);
+  const showTypePicker = !typeSlug && activeTypes.length > 1;
+  const duration = eventType?.duration ?? DEFAULT_EVENT_TYPE.duration;
+  const isAutoConfirm = Boolean(eventType?.autoConfirm);
+  const questions = eventType?.questions || [];
+
   useEffect(() => {
     document.title = step === 2
-      ? 'Request sent · Bookly'
-      : `${MEETING_TITLE} with ${HOST_NAME} · Bookly`;
-  }, [step]);
-
-  // Firebase Data Sync
-  useEffect(() => {
-    if (!hasFirebaseConfig) {
-      setAppointments(loadLocalAppointments());
-      setDataLoading(false);
-      return;
-    }
-
-    let unsubscribeSlots = () => {};
-    let unsubscribeAvailability = () => {};
-    let unsubscribeBlocks = () => {};
-    let isMounted = true;
-
-    getFirebaseServices()
-      .then((services) => {
-        if (!isMounted) return;
-
-        // The host's working hours, days off, buffer and daily limit (admin Settings tab).
-        unsubscribeAvailability = services.onSnapshot(
-          services.doc(services.db, 'config', 'availability'),
-          (snapshot) => setAvailability(normalizeAvailability(snapshot.data())),
-          (error) => console.error("Firestore Error:", error)
-        );
-
-        unsubscribeBlocks = services.onSnapshot(
-          services.collection(services.db, 'blocks'),
-          (snapshot) => setBlocks(snapshot.docs.map(snapshotDoc => snapshotDoc.data())),
-          (error) => console.error("Firestore Error:", error)
-        );
-
-        unsubscribeSlots = services.onSnapshot(
-          services.collection(services.db, 'slots'),
-          (snapshot) => {
-            setAppointments(snapshot.docs.map(snapshotDoc => ({ id: snapshotDoc.id, ...snapshotDoc.data() })));
-            setErrorMessage('');
-            setDataLoading(false);
-          },
-          (error) => {
-            console.error("Firestore Error:", error);
-            setErrorMessage('Unable to load availability. Please refresh and try again.');
-            setDataLoading(false);
-          }
-        );
-      })
-      .catch((error) => {
-        console.error("Firestore Setup Error:", error);
-        if (!isMounted) return;
-        setErrorMessage('Unable to load availability. Please refresh and try again.');
-        setDataLoading(false);
-      });
-
-    return () => {
-      isMounted = false;
-      unsubscribeSlots();
-      unsubscribeAvailability();
-      unsubscribeBlocks();
-    };
-  }, []);
-
-  const handleDateSelect = (day) => {
-    const newDate = new Date(currentDate.getFullYear(), currentDate.getMonth(), day);
-    setSelectedDate(newDate);
-    setSelectedTimeSlot(null); // Reset time when date changes
-    setErrorMessage('');
-  };
-
-  const handleNextMonth = () => {
-    setCurrentDate(new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 1));
-  };
-
-  const handlePrevMonth = () => {
-    setCurrentDate(new Date(currentDate.getFullYear(), currentDate.getMonth() - 1, 1));
-  };
-
-  const handleTimeSelect = (slotId) => {
-    setSelectedTimeSlot(slotId);
-    setErrorMessage('');
-  };
+      ? `${isAutoConfirm ? 'Booked' : 'Request sent'} · Bookly`
+      : `${eventType ? eventType.title : 'Book a meeting'} with ${HOST_NAME} · Bookly`;
+  }, [step, eventType, isAutoConfirm]);
 
   const proceedToForm = () => {
     if (selectedDate && selectedTimeSlot) {
@@ -198,83 +175,112 @@ export default function App() {
       return;
     }
 
+    const missing = questions.find(question => question.required && !(answers[question.id] || '').trim());
+    if (missing) {
+      setErrorMessage(`Please answer "${missing.label}".`);
+      return;
+    }
+
     setIsSubmitting(true);
     setErrorMessage('');
 
     try {
       const dateString = formatDateKey(selectedDate);
-      const slotId = getSlotId(dateString, selectedTimeSlot);
       // Re-check: the form may have sat open while the slot was taken, fell inside the notice window,
       // or the host changed their hours.
-      if (!getAvailableTimes(dateString, availability, appointments, blocks).includes(selectedTimeSlot)) {
+      if (!getAvailableTimes(dateString, availability, appointments, blocks, duration).includes(selectedTimeSlot)) {
         throw new Error('SLOT_ALREADY_BOOKED');
       }
 
       const token = createManageToken();
+      const cellTimes = getCellTimes(selectedTimeSlot, duration);
+      const bookingAnswers = collectAnswers(questions, answers);
       const booking = {
         date: dateString,
         time: selectedTimeSlot,
         name: trimmedFormData.name,
         email: trimmedFormData.email,
         notes: trimmedFormData.notes,
-        status: 'pending',
+        status: isAutoConfirm ? 'confirmed' : 'pending',
+        typeId: eventType.id,
+        typeTitle: eventType.title,
+        duration,
+        meetingLink: eventType.meetingLink || '',
+        ...(bookingAnswers.length ? { answers: bookingAnswers } : {}),
         manageId: token,
         createdAt: new Date().toISOString()
       };
+      let bookingId;
 
       if (hasFirebaseConfig) {
         const services = await getFirebaseServices();
-        const slotRef = services.doc(services.db, 'slots', slotId);
         const bookingRef = services.doc(services.collection(services.db, 'bookings'));
         const manageRef = services.doc(services.db, 'manage', token);
+        const cellRefs = cellTimes.map(time => services.doc(services.db, 'slots', getSlotId(dateString, time)));
+        bookingId = bookingRef.id;
 
-        // The slot doc acts as a lock so two people can't request the same time.
+        // Each half-hour cell doc is a lock, so two bookings can't overlap.
         // A pending hold older than PENDING_EXPIRY_HOURS can be taken over.
         await services.runTransaction(services.db, async (transaction) => {
-          const existingSlot = await transaction.get(slotRef);
+          const existingCells = await Promise.all(cellRefs.map(ref => transaction.get(ref)));
 
-          if (existingSlot.exists() && isSlotHeld(existingSlot.data())) {
+          if (existingCells.some(cell => cell.exists() && isSlotHeld(cell.data()))) {
             throw new Error('SLOT_ALREADY_BOOKED');
           }
 
           transaction.set(bookingRef, booking);
           // The booker's view of their booking, readable only by whoever holds the secret token.
           transaction.set(manageRef, {
-            bookingId: bookingRef.id,
+            bookingId,
             date: dateString,
             time: selectedTimeSlot,
             name: booking.name,
             email: booking.email,
-            status: 'pending',
-            meetingLink: '',
+            status: booking.status,
+            typeId: booking.typeId,
+            typeTitle: booking.typeTitle,
+            duration,
+            meetingLink: booking.meetingLink,
             createdAt: booking.createdAt
           });
-          transaction.set(slotRef, {
+          cellRefs.forEach((ref, index) => transaction.set(ref, {
             date: dateString,
-            time: selectedTimeSlot,
-            bookingId: bookingRef.id,
-            confirmed: false,
+            time: cellTimes[index],
+            bookingId,
+            confirmed: isAutoConfirm,
             createdAt: services.serverTimestamp()
-          });
+          }));
         });
       } else {
-        const nextAppointments = [...appointments, { id: slotId, ...booking }];
+        bookingId = getSlotId(dateString, selectedTimeSlot);
+        const nextAppointments = [
+          ...appointments,
+          ...cellTimes.map(time => ({ id: getSlotId(dateString, time), ...booking, time, bookingId }))
+        ];
 
         saveLocalAppointments(nextAppointments);
         setAppointments(nextAppointments);
       }
 
-      const adminUrl = `${window.location.origin}${window.location.pathname}#admin`;
       const [bookerEmailSent] = await Promise.all([
-        sendEmail({ toEmail: booking.email, ...emailTemplates.requestReceived(booking), replyTo: ADMIN_EMAIL }),
+        sendEmail({
+          toEmail: booking.email,
+          ...(isAutoConfirm ? emailTemplates.confirmed(booking) : emailTemplates.requestReceived(booking)),
+          replyTo: ADMIN_EMAIL
+        }),
         ADMIN_EMAIL
-          ? sendEmail({ toEmail: ADMIN_EMAIL, ...emailTemplates.hostNewRequest(booking, adminUrl), replyTo: booking.email })
+          ? sendEmail({
+            toEmail: ADMIN_EMAIL,
+            ...(isAutoConfirm ? emailTemplates.hostNewBooking(booking, bookingId) : emailTemplates.hostNewRequest(booking, bookingId)),
+            replyTo: booking.email
+          })
           : Promise.resolve(false)
       ]);
 
       setSubmittedEmail(booking.email);
       setEmailSent(bookerEmailSent);
       setManageToken(hasFirebaseConfig ? token : '');
+      setBookedResult({ booking, bookingId });
       setStep(2);
     } catch (error) {
       console.error("Error booking appointment:", error);
@@ -298,164 +304,32 @@ export default function App() {
     setSelectedDate(null);
     setSelectedTimeSlot(null);
     setFormData({ name: '', email: '', notes: '' });
+    setAnswers({});
     setErrorMessage('');
     setSubmittedEmail('');
     setEmailSent(false);
     setManageToken('');
+    setBookedResult(null);
   };
 
-  const renderCalendar = () => {
-    const year = currentDate.getFullYear();
-    const month = currentDate.getMonth();
-    const daysInMonth = getDaysInMonth(year, month);
-    const firstDay = getFirstDayOfMonth(year, month);
-
-    const days = [];
-    // Padding for first day
-    for (let i = 0; i < firstDay; i++) {
-      days.push(<div key={`empty-${i}`} aria-hidden="true" />);
-    }
-
-    const now = Date.now();
-    const hostTodayKey = getHostTodayKey(now);
-    const thisMonth = new Date();
-    const canGoBack = year > thisMonth.getFullYear() || (year === thisMonth.getFullYear() && month > thisMonth.getMonth());
-    const canGoForward = new Date(year, month + 1, 1).getTime() <= now + MAX_DAYS_AHEAD * 24 * 60 * 60 * 1000;
-
-    for (let day = 1; day <= daysInMonth; day++) {
-      const iterDate = new Date(year, month, day);
-      const dateKey = formatDateKey(iterDate);
-      // Selectable only when the host's hours leave at least one open time (also covers past days,
-      // days off, the booking window, full days and the notice period).
-      const isSelectable = dateKey >= hostTodayKey
-        && getAvailableTimes(dateKey, availability, appointments, blocks, now).length > 0;
-      const isToday = dateKey === hostTodayKey;
-
-      const isSelected = selectedDate &&
-                         selectedDate.getDate() === day &&
-                         selectedDate.getMonth() === month &&
-                         selectedDate.getFullYear() === year;
-
-      days.push(
-        <button
-          key={`day-${day}`}
-          onClick={() => isSelectable && handleDateSelect(day)}
-          disabled={!isSelectable}
-          aria-pressed={Boolean(isSelected)}
-          aria-label={`${formatDisplayDate(iterDate)}${isSelectable ? '' : ', unavailable'}`}
-          className={`relative mx-auto size-10 sm:size-11 rounded-full grid place-items-center text-sm transition-all duration-150
-            ${isSelected
-              ? 'bg-brand text-on-brand font-semibold shadow-[var(--shadow-pop)] scale-105'
-              : isSelectable
-                ? 'bg-brand-soft text-brand-ink font-semibold hover:bg-brand hover:text-on-brand cursor-pointer'
-                : 'text-ink-3/60 cursor-not-allowed'}
-          `}
-        >
-          {day}
-          {isToday && (
-            <span className={`absolute bottom-1 size-1 rounded-full ${isSelected ? 'bg-white' : 'bg-brand'}`} />
-          )}
-        </button>
-      );
-    }
-
-    return (
-      <div className="min-w-0">
-        <div className="flex items-center justify-between mb-5">
-          <h3 className="text-base font-semibold text-ink">
-            {MONTH_NAMES[month]} <span className="text-ink-3 font-normal">{year}</span>
-          </h3>
-          <div className="flex gap-1">
-            <button onClick={handlePrevMonth} disabled={!canGoBack} aria-label="Previous month" className="btn btn-ghost !p-2">
-              <ChevronLeft size={18} />
-            </button>
-            <button onClick={handleNextMonth} disabled={!canGoForward} aria-label="Next month" className="btn btn-ghost !p-2">
-              <ChevronRight size={18} />
-            </button>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-7 gap-y-2 text-center mb-2">
-          {DAY_NAMES.map(day => (
-            <div key={day} className="text-[11px] font-semibold text-ink-3 tracking-widest">
-              {day}
-            </div>
-          ))}
-        </div>
-        <div key={`${year}-${month}`} className="grid grid-cols-7 gap-y-1.5 animate-rise">
-          {days}
-        </div>
-      </div>
-    );
-  };
-
-  const renderTimeSlots = () => {
-    if (!selectedDate) {
-      return (
-        <div className="hidden lg:flex flex-col items-center justify-center text-center rounded-2xl border border-dashed border-line p-6 text-ink-3">
-          <CalendarDays size={28} className="mb-3" />
-          <p className="text-sm">Pick a highlighted day to see open times.</p>
-        </div>
-      );
-    }
-
-    const dateString = formatDateKey(selectedDate);
-
-    const availableSlots = getAvailableTimes(dateString, availability, appointments, blocks)
-      .map(time => ({ id: time, label: getTimeLabel(time) }));
-    const showVisitorTime = !visitorIsInHostTimeZone();
-
-    return (
-      <div key={dateString} className="min-w-0 animate-rise">
-        <h3 className="text-base font-semibold text-ink">{formatDisplayDate(selectedDate)}</h3>
-        <p className="text-xs text-ink-3 mt-0.5 mb-4">Times in {TIME_ZONE_LABEL}</p>
-        <div className="flex flex-col gap-2 lg:max-h-[380px] lg:overflow-y-auto lg:pr-1 -mr-1">
-          {availableSlots.map(slot => {
-            const isSelected = selectedTimeSlot === slot.id;
-
-            return (
-              <div key={slot.id} className="flex gap-2">
-                <button
-                  onClick={() => handleTimeSelect(slot.id)}
-                  aria-pressed={isSelected}
-                  className={`min-h-12 rounded-xl border text-sm font-semibold transition-all duration-200
-                    ${isSelected
-                      ? 'flex-1 bg-ink text-surface border-ink'
-                      : 'w-full bg-surface border-line text-ink hover:border-brand hover:text-brand'}
-                  `}
-                >
-                  {slot.label}
-                  {showVisitorTime && (
-                    <span className={`block text-[11px] font-normal ${isSelected ? 'opacity-70' : 'text-ink-3'}`}>
-                      {formatInVisitorTime(dateString, slot.id)} your time
-                    </span>
-                  )}
-                </button>
-                {isSelected && (
-                  <button onClick={proceedToForm} className="btn btn-primary flex-1 !rounded-xl animate-rise">
-                    Next <ArrowRight size={16} />
-                  </button>
-                )}
-              </div>
-            );
-          })}
-          {availableSlots.length === 0 && (
-            <p className="text-ink-3 text-sm rounded-xl bg-muted px-4 py-6 text-center">No open times on this day.</p>
-          )}
-        </div>
-      </div>
-    );
-  };
+  const shownError = errorMessage || loadError;
 
   const renderPicker = () => (
     <div className="p-6 sm:p-8">
       <h2 className="text-xl sm:text-2xl font-semibold tracking-tight text-ink">Pick a date & time</h2>
       <p className="text-sm text-ink-2 mt-1 mb-6">Highlighted days have open times.</p>
-      {errorMessage && <Banner className="mb-6">{errorMessage}</Banner>}
-      <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_220px]">
-        {renderCalendar()}
-        {renderTimeSlots()}
-      </div>
+      {shownError && <Banner className="mb-6">{shownError}</Banner>}
+      <SlotPicker
+        availability={availability}
+        cells={appointments}
+        blocks={blocks}
+        duration={duration}
+        selectedDate={selectedDate}
+        selectedTime={selectedTimeSlot}
+        onSelectDate={(date) => { setSelectedDate(date); setSelectedTimeSlot(null); setErrorMessage(''); }}
+        onSelectTime={(time) => { setSelectedTimeSlot(time); setErrorMessage(''); }}
+        onNext={proceedToForm}
+      />
     </div>
   );
 
@@ -465,7 +339,9 @@ export default function App() {
         <ArrowLeft size={16} /> Back
       </button>
       <h2 className="text-xl sm:text-2xl font-semibold tracking-tight text-ink">Your details</h2>
-      <p className="text-sm text-ink-2 mt-1 mb-6">We'll email you as soon as {HOST_NAME} responds.</p>
+      <p className="text-sm text-ink-2 mt-1 mb-6">
+        {isAutoConfirm ? "We'll email your confirmation right away." : `We'll email you as soon as ${HOST_NAME} responds.`}
+      </p>
       {errorMessage && <Banner className="mb-6">{errorMessage}</Banner>}
 
       <form onSubmit={handleFormSubmit} className="space-y-5 max-w-md">
@@ -495,6 +371,14 @@ export default function App() {
             className="field"
           />
         </div>
+        {questions.map(question => (
+          <QuestionField
+            key={question.id}
+            question={question}
+            value={answers[question.id] || ''}
+            onChange={(value) => setAnswers({ ...answers, [question.id]: value })}
+          />
+        ))}
         <div>
           <label htmlFor="notes" className="block text-sm font-medium text-ink mb-1.5">
             Anything to prepare? <span className="text-ink-3 font-normal">Optional</span>
@@ -511,22 +395,93 @@ export default function App() {
         <div className="pt-1">
           <button type="submit" disabled={isSubmitting} className="btn btn-primary w-full sm:w-auto px-7 py-3">
             {isSubmitting && <Loader2 size={16} className="animate-spin" />}
-            {isSubmitting ? 'Sending request…' : 'Request booking'}
+            {isSubmitting
+              ? (isAutoConfirm ? 'Booking…' : 'Sending request…')
+              : (isAutoConfirm ? 'Confirm booking' : 'Request booking')}
           </button>
           <p className="text-xs text-ink-3 mt-3">
-            Your time is held for {PENDING_EXPIRY_HOURS} hours while {HOST_NAME} confirms.
+            {isAutoConfirm
+              ? 'This meeting type is confirmed instantly.'
+              : `Your time is held for ${PENDING_EXPIRY_HOURS} hours while ${HOST_NAME} confirms.`}
           </p>
         </div>
       </form>
     </div>
   );
 
+  const renderNextSteps = (items) => (
+    <ol className="mt-8 w-full max-w-sm text-left animate-rise">
+      {items.map((item, index) => (
+        <li key={item.title} className="relative flex gap-4 pb-6 last:pb-0">
+          {index < items.length - 1 && (
+            <span className="absolute left-[13px] top-7 bottom-0 w-px bg-line" aria-hidden="true" />
+          )}
+          <span className={`relative size-7 shrink-0 rounded-full grid place-items-center text-xs font-semibold
+            ${item.done ? 'bg-success text-on-brand' : 'bg-muted text-ink-3 border border-line'}`}>
+            {item.done ? <Check size={14} strokeWidth={3} /> : index + 1}
+          </span>
+          <div>
+            <p className="text-sm font-semibold text-ink">{item.title}</p>
+            <p className="text-sm text-ink-2 break-all">{item.detail}</p>
+          </div>
+        </li>
+      ))}
+    </ol>
+  );
+
+  const renderSuccessActions = () => (
+    <>
+      <div className="mt-10 flex flex-col sm:flex-row gap-3">
+        {manageToken && (
+          <a href={getManageUrl(manageToken)} className="btn btn-primary">
+            View my booking <ArrowRight size={16} />
+          </a>
+        )}
+        <button onClick={resetFlow} className="btn btn-outline">
+          Book another time
+        </button>
+      </div>
+      {manageToken && (
+        <p className="text-xs text-ink-3 mt-3 max-w-xs">The link is also in your email. Use it to check the details, change the time or cancel.</p>
+      )}
+    </>
+  );
+
   const renderSuccess = () => {
-    const nextSteps = [
-      { title: 'Request sent', detail: emailSent ? `A copy is in ${submittedEmail}.` : `We'll write to ${submittedEmail}.`, done: true },
-      { title: `${HOST_NAME} reviews it`, detail: `Usually well within ${PENDING_EXPIRY_HOURS} hours.`, done: false },
-      { title: 'You get a confirmation', detail: 'With the meeting link and time.', done: false }
-    ];
+    if (bookedResult?.booking.status === 'confirmed') {
+      const { booking, bookingId } = bookedResult;
+      return (
+        <div className="p-6 sm:p-10 flex flex-col items-center text-center">
+          <div className="relative mb-6 animate-pop">
+            <div className="absolute inset-0 rounded-full bg-success-soft blur-xl scale-150" aria-hidden="true" />
+            <div className="relative size-16 rounded-full bg-success-soft grid place-items-center ring-8 ring-success-soft/40">
+              <CheckCircle2 size={30} className="text-success" />
+            </div>
+          </div>
+          <span className="pill bg-success-soft text-success mb-3 animate-rise">Confirmed</span>
+          <h2 className="text-2xl sm:text-3xl font-semibold tracking-tight text-ink animate-rise">You're booked</h2>
+          <p className="text-ink-2 mt-2 max-w-md animate-rise">
+            {emailSent ? `The details are on their way to ${submittedEmail}.` : `Save the details below; we couldn't email ${submittedEmail}.`}
+          </p>
+          {booking.meetingLink && (
+            <a href={booking.meetingLink} target="_blank" rel="noreferrer" className="mt-4 text-sm text-brand hover:underline break-all animate-rise">
+              {booking.meetingLink}
+            </a>
+          )}
+
+          <div className="mt-8 w-full max-w-sm animate-rise">
+            <p className="text-sm font-medium text-ink mb-2">Add to calendar</p>
+            <div className="grid grid-cols-3 gap-2">
+              <a href={getGoogleCalendarUrl(booking)} target="_blank" rel="noreferrer" className="btn btn-outline !px-3">Google</a>
+              <a href={getOutlookCalendarUrl(booking)} target="_blank" rel="noreferrer" className="btn btn-outline !px-3">Outlook</a>
+              <button onClick={() => downloadIcsFile(booking, bookingId)} className="btn btn-outline !px-3"><Download size={16} /> .ics</button>
+            </div>
+          </div>
+
+          {renderSuccessActions()}
+        </div>
+      );
+    }
 
     return (
       <div className="p-6 sm:p-10 flex flex-col items-center text-center">
@@ -542,37 +497,13 @@ export default function App() {
           Your time is reserved. You'll get an email once {HOST_NAME} confirms or declines.
         </p>
 
-        <ol className="mt-8 w-full max-w-sm text-left animate-rise">
-          {nextSteps.map((item, index) => (
-            <li key={item.title} className="relative flex gap-4 pb-6 last:pb-0">
-              {index < nextSteps.length - 1 && (
-                <span className="absolute left-[13px] top-7 bottom-0 w-px bg-line" aria-hidden="true" />
-              )}
-              <span className={`relative size-7 shrink-0 rounded-full grid place-items-center text-xs font-semibold
-                ${item.done ? 'bg-success text-on-brand' : 'bg-muted text-ink-3 border border-line'}`}>
-                {item.done ? <Check size={14} strokeWidth={3} /> : index + 1}
-              </span>
-              <div>
-                <p className="text-sm font-semibold text-ink">{item.title}</p>
-                <p className="text-sm text-ink-2 break-all">{item.detail}</p>
-              </div>
-            </li>
-          ))}
-        </ol>
+        {renderNextSteps([
+          { title: 'Request sent', detail: emailSent ? `A copy is in ${submittedEmail}.` : `We'll write to ${submittedEmail}.`, done: true },
+          { title: `${HOST_NAME} reviews it`, detail: `Usually well within ${PENDING_EXPIRY_HOURS} hours.`, done: false },
+          { title: 'You get a confirmation', detail: 'With the meeting link and time.', done: false }
+        ])}
 
-        <div className="mt-10 flex flex-col sm:flex-row gap-3">
-          {manageToken && (
-            <a href={getManageUrl(manageToken)} className="btn btn-primary">
-              View my booking <ArrowRight size={16} />
-            </a>
-          )}
-          <button onClick={resetFlow} className="btn btn-outline">
-            Book another time
-          </button>
-        </div>
-        {manageToken && (
-          <p className="text-xs text-ink-3 mt-3 max-w-xs">The link is also in your email. Use it to check the status or cancel.</p>
-        )}
+        {renderSuccessActions()}
       </div>
     );
   };
@@ -580,24 +511,33 @@ export default function App() {
   const steps = ['Choose a time', 'Your details', 'Done'];
   const selectedSlotLabel = selectedTimeSlot ? getTimeLabel(selectedTimeSlot) : '';
 
+  const renderHostHeader = () => (
+    <div className="flex items-center gap-3">
+      <Avatar name={HOST_NAME} size="size-12" className="text-lg ring-4 ring-surface" />
+      <div>
+        <p className="text-sm text-ink-2">{HOST_NAME}</p>
+        <p className="text-xs text-ink-3">Host</p>
+      </div>
+    </div>
+  );
+
   const renderSidebar = () => (
     <aside className="p-6 sm:p-8 border-b md:border-b-0 md:border-r border-line flex flex-col gap-6 bg-muted/40">
       <div>
-        <div className="flex items-center gap-3 mb-5">
-          <Avatar name={HOST_NAME} size="size-12" className="text-lg ring-4 ring-surface" />
-          <div>
-            <p className="text-sm text-ink-2">{HOST_NAME}</p>
-            <p className="text-xs text-ink-3">Host</p>
-          </div>
-        </div>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{MEETING_TITLE}</h1>
+        {activeTypes.length > 1 && step === 0 && (
+          <a href="#" className="btn btn-ghost -ml-3 -mt-2 mb-3 text-sm"><ArrowLeft size={16} /> All meeting types</a>
+        )}
+        <div className="mb-5">{renderHostHeader()}</div>
+        <h1 className="text-2xl font-semibold tracking-tight text-ink">{eventType.title}</h1>
+        {eventType.description && <p className="text-sm text-ink-2 mt-2 whitespace-pre-line">{eventType.description}</p>}
       </div>
 
       <ul className="space-y-3 text-sm text-ink-2">
         {[
-          { Icon: Clock, text: '30 min' },
-          { Icon: Video, text: 'Video call, link sent on confirmation' },
-          { Icon: Globe, text: TIME_ZONE_LABEL }
+          { Icon: Clock, text: formatDuration(duration) },
+          { Icon: Video, text: isAutoConfirm ? 'Video call, link sent with your confirmation' : 'Video call, link sent on confirmation' },
+          { Icon: Globe, text: TIME_ZONE_LABEL },
+          ...(isAutoConfirm ? [{ Icon: Zap, text: 'Confirmed instantly' }] : [])
         ].map(({ Icon, text }) => (
           <li key={text} className="flex items-center gap-3">
             <span className="size-8 rounded-lg bg-surface border border-line grid place-items-center shrink-0">
@@ -636,6 +576,79 @@ export default function App() {
     </aside>
   );
 
+  const renderTypePicker = () => (
+    <div className="card max-w-2xl mx-auto overflow-hidden animate-rise">
+      <div className="p-6 sm:p-8 border-b border-line bg-muted/40">
+        {renderHostHeader()}
+        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-ink mt-5">Book a meeting</h1>
+        <p className="text-ink-2 mt-1">Choose what you'd like to meet about.</p>
+      </div>
+      <ul className="divide-y divide-line">
+        {activeTypes.map(type => (
+          <li key={type.id}>
+            <a href={`#book/${type.id}`} className="group flex items-center gap-4 p-5 sm:px-8 hover:bg-muted/60 transition-colors">
+              <span className="size-11 shrink-0 rounded-xl bg-brand-soft text-brand-ink grid place-items-center text-xs font-bold">
+                {type.duration < 60 ? `${type.duration}m` : `${type.duration / 60}h`}
+              </span>
+              <span className="flex-1 min-w-0">
+                <span className="block font-semibold text-ink">{type.title}</span>
+                {type.description && <span className="block text-sm text-ink-2 truncate">{type.description}</span>}
+                <span className="mt-1.5 flex flex-wrap gap-1.5">
+                  <span className="pill bg-muted text-ink-2"><Clock size={12} /> {formatDuration(type.duration)}</span>
+                  {type.autoConfirm
+                    ? <span className="pill bg-success-soft text-success"><Zap size={12} /> Instant confirmation</span>
+                    : <span className="pill bg-muted text-ink-2">Needs approval</span>}
+                </span>
+              </span>
+              <ArrowRight size={18} className="text-ink-3 group-hover:text-brand group-hover:translate-x-0.5 transition-all shrink-0" />
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+
+  const renderTypeNotFound = () => (
+    <div className="card max-w-md mx-auto p-8 text-center animate-rise">
+      <span className="mx-auto mb-4 size-12 rounded-2xl bg-muted grid place-items-center text-ink-3"><CalendarX2 size={22} /></span>
+      <h1 className="text-xl font-semibold text-ink">This meeting type isn't available</h1>
+      <p className="text-sm text-ink-2 mt-1 mb-6">The link may be old, or {HOST_NAME} has turned it off.</p>
+      <a href="#" className="btn btn-primary">See available meetings</a>
+    </div>
+  );
+
+  const renderContent = () => {
+    if (dataLoading) {
+      return (
+        <div className="card grid md:grid-cols-[300px_1fr] overflow-hidden" aria-busy="true" aria-label="Loading">
+          <div className="p-8 space-y-4 border-b md:border-b-0 md:border-r border-line">
+            <div className="skeleton size-12 !rounded-full" />
+            <div className="skeleton h-7 w-3/4" />
+            <div className="skeleton h-4 w-1/2" />
+            <div className="skeleton h-4 w-2/3" />
+          </div>
+          <div className="p-8 space-y-4">
+            <div className="skeleton h-7 w-1/3" />
+            <div className="skeleton h-64 w-full" />
+          </div>
+        </div>
+      );
+    }
+    if (showTypePicker) return renderTypePicker();
+    if (!eventType) return renderTypeNotFound();
+
+    return (
+      <div className="card grid md:grid-cols-[300px_minmax(0,1fr)] overflow-hidden animate-rise">
+        {renderSidebar()}
+        <section className="min-w-0">
+          {step === 0 && renderPicker()}
+          {step === 1 && renderForm()}
+          {step === 2 && renderSuccess()}
+        </section>
+      </div>
+    );
+  };
+
   return (
     <div className="min-h-screen flex flex-col">
       <header className="mx-auto w-full max-w-5xl px-4 sm:px-6 pt-6">
@@ -643,29 +656,7 @@ export default function App() {
       </header>
 
       <main className="flex-1 mx-auto w-full max-w-5xl px-4 sm:px-6 py-6 sm:py-10">
-        {dataLoading ? (
-          <div className="card grid md:grid-cols-[300px_1fr] overflow-hidden" aria-busy="true" aria-label="Loading">
-            <div className="p-8 space-y-4 border-b md:border-b-0 md:border-r border-line">
-              <div className="skeleton size-12 !rounded-full" />
-              <div className="skeleton h-7 w-3/4" />
-              <div className="skeleton h-4 w-1/2" />
-              <div className="skeleton h-4 w-2/3" />
-            </div>
-            <div className="p-8 space-y-4">
-              <div className="skeleton h-7 w-1/3" />
-              <div className="skeleton h-64 w-full" />
-            </div>
-          </div>
-        ) : (
-          <div className="card grid md:grid-cols-[300px_minmax(0,1fr)] overflow-hidden animate-rise">
-            {renderSidebar()}
-            <section className="min-w-0">
-              {step === 0 && renderPicker()}
-              {step === 1 && renderForm()}
-              {step === 2 && renderSuccess()}
-            </section>
-          </div>
-        )}
+        {renderContent()}
       </main>
 
       <footer className="pb-6 text-center text-xs text-ink-3">

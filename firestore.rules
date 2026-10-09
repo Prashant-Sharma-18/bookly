@@ -50,20 +50,80 @@ service cloud.firestore {
         && toMinutes(time) + 30 <= toMinutes(hours.end);
     }
 
+    // A booking reserves one slots doc per half-hour cell it covers (see getCellTimes in src/booking.js).
+    // "YYYY-MM-DD_HHMM" id of the k-th cell of a meeting starting at `time`.
+    function cellId(date, time, k) {
+      let m = toMinutes(time) + k * 30;
+      let h = int(m / 60); // not math.floor: in rules that returns a float, which would stringify as "10.0"
+      return date + '_' + (h < 10 ? '0' : '') + string(h) + (m % 60 == 0 ? '00' : '30');
+    }
+
+    function ownsCell(booking, bookingId, k) {
+      return getAfter(docPath('slots', cellId(booking.date, booking.time, k))).data.bookingId == bookingId;
+    }
+
+    // Lengths are 15/30/45/60/90/120 minutes, i.e. 1, 1, 2, 2, 3 or 4 cells.
+    // Bookings from before meeting types have no duration and are 30 minutes.
+    function ownsAllCells(booking, bookingId) {
+      let length = booking.get('duration', 30);
+      return ownsCell(booking, bookingId, 0)
+        && (length <= 30 || ownsCell(booking, bookingId, 1))
+        && (length <= 60 || ownsCell(booking, bookingId, 2))
+        && (length <= 90 || ownsCell(booking, bookingId, 3));
+    }
+
+    // Whether the booking's meeting type confirms instantly (decides if a moved booking stays confirmed).
+    function typeConfirmsInstantly(booking) {
+      return booking.get('typeId', '') != ''
+        && exists(docPath('eventTypes', booking.typeId))
+        && get(docPath('eventTypes', booking.typeId)).data.active == true
+        && get(docPath('eventTypes', booking.typeId)).data.autoConfirm == true;
+    }
+
+    // True when this request is the guest's reschedule of `bookingId` (the booking's rescheduledAt
+    // is being set to this request's time, which only the guest flow below allows).
+    function isBeingRescheduled(bookingId) {
+      return getAfter(docPath('bookings', bookingId)).data.get('rescheduledAt', null) == request.time;
+    }
+
     // A new hold: the right fields, a server timestamp, a time inside the booking window and the
-    // host's hours, and a matching pending booking written in the same transaction.
+    // host's hours, and part of a booking written in the same transaction (marked confirmed only
+    // when that booking was confirmed instantly).
     function isValidNewSlot(slotId) {
       let data = request.resource.data;
       return data.keys().hasOnly(['date', 'time', 'bookingId', 'confirmed', 'createdAt'])
         && data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
         && data.time.matches('^[0-9]{2}:(00|30)$')
         && slotId == data.date + '_' + data.time.replace(':', '')
-        && data.confirmed == false
         && data.createdAt == request.time
         && slotStart(data.date, data.time) >= request.time + duration.value(120, 'm')
         && slotStart(data.date, data.time) <= request.time + duration.value(60, 'd')
         && isWithinHours(data.date, data.time)
-        && existsAfter(docPath('bookings', data.bookingId));
+        && existsAfter(docPath('bookings', data.bookingId))
+        && isCellOfBooking(data, getAfter(docPath('bookings', data.bookingId)).data);
+    }
+
+    function isCellOfBooking(cell, booking) {
+      return coversCell(booking, cell) && cell.confirmed == (booking.status == 'confirmed');
+    }
+
+    function coversCell(booking, cell) {
+      return booking.date == cell.date
+        && toMinutes(cell.time) >= toMinutes(booking.time)
+        && toMinutes(cell.time) < toMinutes(booking.time) + booking.get('duration', 30);
+    }
+
+    // The booking must match its meeting type: active, same length and fixed link, and confirmed
+    // up front only if the type confirms instantly. Without a saved type doc, only the built-in
+    // default (DEFAULT_EVENT_TYPE in src/booking.js: '30min', 30 minutes, needs approval) is accepted.
+    function matchesMeetingType(data) {
+      let typePath = docPath('eventTypes', data.typeId);
+      return exists(typePath)
+        ? get(typePath).data.active == true
+          && get(typePath).data.duration == data.duration
+          && get(typePath).data.meetingLink == data.meetingLink
+          && (data.status == 'pending' || get(typePath).data.autoConfirm == true)
+        : data.typeId == '30min' && data.duration == 30 && data.meetingLink == '' && data.status == 'pending';
     }
 
     function isExpiredHold() {
@@ -76,38 +136,71 @@ service cloud.firestore {
     match /slots/{slotId} {
       allow read: if true;
 
-      // Anyone can claim a free slot, or take over a pending hold that has expired.
+      // Anyone can claim a free slot or take over an expired pending hold. A guest moving their
+      // booking to an overlapping time re-holds the cells they already have.
       allow create: if isValidNewSlot(slotId);
-      allow update: if (isValidNewSlot(slotId) && isExpiredHold())
+      allow update: if (isValidNewSlot(slotId)
+          && (isExpiredHold()
+            || (resource.data.bookingId == request.resource.data.bookingId && isBeingRescheduled(resource.data.bookingId))))
         || (isAdmin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['confirmed']));
 
-      // Freed by the host, or as part of a guest cancelling their own booking.
+      // Freed by the host, when the guest cancels, or when the guest moves their booking away from it.
       allow delete: if isAdmin()
-        || getAfter(docPath('bookings', resource.data.bookingId)).data.status == 'cancelled';
+        || getAfter(docPath('bookings', resource.data.bookingId)).data.status == 'cancelled'
+        || (isBeingRescheduled(resource.data.bookingId)
+          && !coversCell(getAfter(docPath('bookings', resource.data.bookingId)).data, resource.data));
     }
 
     // Full booking details. Only the host can read them.
     match /bookings/{bookingId} {
-      allow create: if request.resource.data.keys().hasOnly(['date', 'time', 'name', 'email', 'notes', 'status', 'manageId', 'createdAt'])
-        && request.resource.data.status == 'pending'
+      allow create: if request.resource.data.keys().hasOnly(['date', 'time', 'name', 'email', 'notes', 'status', 'manageId', 'typeId', 'typeTitle', 'duration', 'meetingLink', 'answers', 'createdAt'])
+        && (!('answers' in request.resource.data) || (request.resource.data.answers is list && request.resource.data.answers.size() <= 5))
+        && request.resource.data.status in ['pending', 'confirmed']
+        && request.resource.data.typeId is string
+        && request.resource.data.typeTitle is string && request.resource.data.typeTitle.size() <= 100
+        && request.resource.data.duration in [15, 30, 45, 60, 90, 120]
+        && request.resource.data.meetingLink is string
+        && matchesMeetingType(request.resource.data)
         && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 100
         && request.resource.data.email is string && request.resource.data.email.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$')
         && request.resource.data.notes is string && request.resource.data.notes.size() <= 2000
         && request.resource.data.manageId.matches('^[a-f0-9]{32}$')
         && getAfter(docPath('manage', request.resource.data.manageId)).data.bookingId == bookingId
-        && getAfter(docPath('slots', request.resource.data.date + '_' + request.resource.data.time.replace(':', ''))).data.bookingId == bookingId;
+        && ownsAllCells(request.resource.data, bookingId);
 
       allow read: if isAdmin();
 
-      // The host can change anything. A guest can only cancel, and only together with their manage doc,
-      // whose id (the secret token) is stored here where only the host can read it.
+      // The host can change anything. A guest can only cancel or move an upcoming booking, and only
+      // together with their manage doc, whose id (the secret token) is stored here where only the
+      // host can read it.
       allow update: if isAdmin()
         || (resource.data.status in ['pending', 'confirmed']
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledBy', 'decidedAt'])
           && request.resource.data.status == 'cancelled'
           && request.resource.data.cancelledBy == 'booker'
           && resource.data.get('manageId', '') != ''
-          && getAfter(docPath('manage', resource.data.manageId)).data.status == 'cancelled');
+          && getAfter(docPath('manage', resource.data.manageId)).data.status == 'cancelled')
+        || isGuestReschedule(bookingId);
+    }
+
+    // Moving a booking: new date/time held by all of its cells (each cell is checked for hours,
+    // notice and overlaps by the slots rules), the old time recorded, and confirmed only if the
+    // meeting type confirms instantly. The manage doc must move with it.
+    function isGuestReschedule(bookingId) {
+      let before = resource.data;
+      let after = request.resource.data;
+      return before.status in ['pending', 'confirmed']
+        && slotStart(before.date, before.time) > request.time
+        && after.diff(before).affectedKeys().hasOnly(['date', 'time', 'status', 'rescheduledAt', 'previousDate', 'previousTime'])
+        && after.rescheduledAt == request.time
+        && after.previousDate == before.date
+        && after.previousTime == before.time
+        && (after.status == 'pending' || (after.status == 'confirmed' && typeConfirmsInstantly(before)))
+        && before.get('manageId', '') != ''
+        && getAfter(docPath('manage', before.manageId)).data.date == after.date
+        && getAfter(docPath('manage', before.manageId)).data.time == after.time
+        && getAfter(docPath('manage', before.manageId)).data.status == after.status
+        && ownsAllCells(after, bookingId);
     }
 
     // A guest's private view of their booking. The document id is a 128-bit random token sent only
@@ -116,9 +209,9 @@ service cloud.firestore {
       allow get: if true;
 
       allow create: if token.matches('^[a-f0-9]{32}$')
-        && request.resource.data.keys().hasOnly(['bookingId', 'date', 'time', 'name', 'email', 'status', 'meetingLink', 'createdAt'])
-        && request.resource.data.status == 'pending'
-        && request.resource.data.meetingLink == ''
+        && request.resource.data.keys().hasOnly(['bookingId', 'date', 'time', 'name', 'email', 'status', 'typeId', 'typeTitle', 'duration', 'meetingLink', 'createdAt'])
+        && request.resource.data.status == getAfter(docPath('bookings', request.resource.data.bookingId)).data.status
+        && request.resource.data.meetingLink == getAfter(docPath('bookings', request.resource.data.bookingId)).data.meetingLink
         && getAfter(docPath('bookings', request.resource.data.bookingId)).data.manageId == token
         && getAfter(docPath('bookings', request.resource.data.bookingId)).data.date == request.resource.data.date
         && getAfter(docPath('bookings', request.resource.data.bookingId)).data.time == request.resource.data.time;
@@ -128,7 +221,33 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt'])
           && request.resource.data.status == 'cancelled'
           && slotStart(resource.data.date, resource.data.time) > request.time
-          && getAfter(docPath('bookings', resource.data.bookingId)).data.status == 'cancelled');
+          && getAfter(docPath('bookings', resource.data.bookingId)).data.status == 'cancelled')
+        // Moving: must match the booking's new date, time and status (checked by isGuestReschedule).
+        || (resource.data.status in ['pending', 'confirmed']
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['date', 'time', 'status', 'rescheduledAt'])
+          && request.resource.data.rescheduledAt == request.time
+          && slotStart(resource.data.date, resource.data.time) > request.time
+          && getAfter(docPath('bookings', resource.data.bookingId)).data.date == request.resource.data.date
+          && getAfter(docPath('bookings', resource.data.bookingId)).data.time == request.resource.data.time
+          && getAfter(docPath('bookings', resource.data.bookingId)).data.status == request.resource.data.status);
+    }
+
+    // Meeting types offered on the booking page. Only the host can change them.
+    match /eventTypes/{typeId} {
+      allow read: if true;
+      allow delete: if isAdmin();
+      allow create, update: if isAdmin()
+        && typeId.matches('^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$')
+        && request.resource.data.keys().hasOnly(['title', 'duration', 'description', 'meetingLink', 'autoConfirm', 'active', 'order', 'questions'])
+        && (!('questions' in request.resource.data) || (request.resource.data.questions is list && request.resource.data.questions.size() <= 5))
+        && request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 80
+        && request.resource.data.duration in [15, 30, 45, 60, 90, 120]
+        && request.resource.data.description is string && request.resource.data.description.size() <= 500
+        && request.resource.data.meetingLink is string
+        && (request.resource.data.meetingLink == '' || request.resource.data.meetingLink.matches('^https://[^ ]+$'))
+        && request.resource.data.autoConfirm is bool
+        && request.resource.data.active is bool
+        && request.resource.data.order is int;
     }
 
     // availability: working hours, days off, buffer and daily limit.

@@ -1,15 +1,38 @@
 # Bookly
 
-A small React appointment scheduler with host approval.
+A small React appointment scheduler with meeting types, host approval or instant confirmation, and Google Calendar busy-time sync.
 
 ## How booking works
 
-1. A visitor picks a time and submits the form. The booking is saved as **pending** and the time disappears for everyone else.
-2. The visitor gets a "request received, not confirmed yet" email. The host gets a "new request" email with a link to the admin page.
-3. The host opens `/#admin`, signs in with Google, and clicks **Confirm** (optionally adding a meeting link) or **Decline**.
-4. The visitor gets a "confirmed" email (with the meeting link and Google / Outlook calendar links) or a "declined" email. Declining, or later cancelling, frees the time again.
+1. A visitor picks a meeting type (when there's more than one), a date and a time, then submits the form.
+2. **Types that need approval:** the booking is saved as **pending** and the time disappears for everyone else.
+   - The visitor gets a "request received, not confirmed yet" email.
+   - The host gets a "new request" email with **Confirm** and **Decline** links. Each opens that booking on the admin page and needs one click there. Opening the link alone never confirms or declines anything, so email link scanners can't trigger it.
+   - The host can also approve on `/#admin` (Google sign-in), optionally adding a meeting link.
+   - The visitor then gets a "confirmed" email (meeting link plus Google / Outlook calendar links) or a "declined" email.
+3. **Types set to "Confirm instantly":** the booking is confirmed straight away with the type's fixed meeting link. The visitor gets the confirmation email and calendar buttons immediately, and the host gets a "new booking" email.
+4. Declining or cancelling frees the time again.
 
-Every booking also gets a private page at `/#manage/<code>`, linked from the visitor's emails and the success screen. It shows the live status and offers add-to-calendar buttons (including an `.ics` download for Apple Calendar) once the booking is confirmed. It also lets the visitor **cancel** the booking; the host is emailed and the time is released.
+### Meeting types (admin > Settings)
+
+Each type has a name, a length (15, 30, 45, 60, 90 or 120 minutes), an optional description, an optional fixed meeting link (for example your personal Meet or Zoom room), "Confirm instantly" on or off, and an on/off switch.
+
+- Each type has its own shareable link: `https://bookly-8b49e.web.app/#book/<link-name>`. The copy button in Settings copies it.
+- The main link (`/`) opens the type directly if only one is active, or shows a picker if several are.
+- Until you save a type, a default "30 Minute Meeting" that needs approval is offered.
+- Start times are always on the half hour. A booking reserves every half-hour it covers (a 60-minute meeting at 10:00 holds 10:00 and 10:30), so meetings of different lengths can't overlap. The rules enforce this, along with the length, fixed link and instant-confirmation setting.
+- **Booking form questions:** each type can ask up to 5 extra questions (short answer, paragraph, phone number or multiple choice), each required or optional. They're asked after name and email. Answers are saved with the booking as asked at the time, so later edits to the questions don't change them. They show on the admin card and in the host's new-booking email.
+
+Every booking also gets a private page at `/#manage/<code>`, linked from the visitor's emails and the success screen. It shows the live status and offers add-to-calendar buttons (including an `.ics` download for Apple Calendar) once the booking is confirmed.
+
+From that page the visitor can also:
+
+- **Change the time.** They pick a new slot of the same length using the same availability rules.
+  - Types set to "Confirm instantly" stay confirmed.
+  - Other types go back to **pending**, and the host gets Confirm/Decline links for the new time.
+  - The old time is released in the same step.
+  - Both sides get an email, and the admin card shows "Moved by the guest from …".
+- **Cancel.** The host is emailed and the time is released.
 
 ### Availability (admin > Settings)
 
@@ -31,6 +54,17 @@ npm run dev
 ```
 
 Without a `.env` the app runs in local mode: bookings are kept only in your browser's local storage, no emails are sent and the admin page is unavailable.
+
+## Tests
+
+```bash
+npm test             # booking logic: time zones, availability, buffers, limits, cells, calendar links
+npm run test:rules   # Firestore security rules, against the local emulator
+```
+
+`npm run test:rules` needs Java installed, and the Firebase CLI downloads the emulator on first run. It tests the committed `firestore.rules`, where the admin is the placeholder `host@example.com`. On Windows, the emulator's Java process sometimes keeps running after the tests. If the next run says "port taken", end the `java` process listening on port 8085.
+
+Run both after changing `src/booking.js` or `firestore.rules`.
 
 ## Firebase setup
 
@@ -99,9 +133,10 @@ The site is hosted on Firebase Hosting (free). `firebase.json` and `.firebaserc`
 
 ## Data model
 
-- `slots/{YYYY-MM-DD_HHMM}`: public. Only the date, time, booking ID, `confirmed` flag and server `createdAt`, used to show availability and work out when a hold expires.
-- `bookings/{autoId}`: private (host only). Name, email, notes, `status` (`pending` | `confirmed` | `declined` | `cancelled`), `cancelledBy`, `meetingLink`, `manageId`, `createdAt`, `decidedAt`.
-- `manage/{secret code}`: the visitor's view of their booking (date, time, name, email, status, meeting link). Readable only by someone who knows the 32-character code, which is sent only to the visitor. Listing is blocked.
+- `slots/{YYYY-MM-DD_HHMM}`: public. One doc per half-hour a booking covers: date, time, booking ID, `confirmed` flag and server `createdAt`. Used to show availability and work out when a hold expires.
+- `bookings/{autoId}`: private (host only). Name, email, notes, `typeId`, `typeTitle`, `duration`, `status` (`pending` | `confirmed` | `declined` | `cancelled`), `cancelledBy`, `meetingLink`, `manageId`, `createdAt`, `decidedAt`. Bookings made before meeting types existed have no type fields and count as 30 minutes.
+- `manage/{secret code}`: the visitor's view of their booking (date, time, name, email, meeting type and length, status, meeting link). Readable only by someone who knows the 32-character code, which is sent only to the visitor. Listing is blocked.
+- `eventTypes/{link-name}`: public. `title`, `duration`, `description`, `meetingLink`, `autoConfirm`, `active`, `order`.
 - `config/availability`: public. Weekly hours, days off, buffer and daily limit.
 - `config/calendarSync`: public. When Google Calendar was last synced and how many busy blocks it produced.
 - `blocks/{autoId}`: public. Busy times: `date`, `start`, `end` (host time, 30-minute steps, `24:00` = midnight) and `source` (`manual` | `google`).
